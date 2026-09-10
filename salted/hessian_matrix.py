@@ -1,0 +1,261 @@
+import os
+import os.path as osp
+import random
+import sys
+import time
+
+import numpy as np
+from scipy import sparse
+
+from salted import get_averages
+from salted.sys_utils import (
+    ParseConfig,
+    check_MPI_tasks_count,
+    detect_mpi,
+    distribute_jobs,
+    format_index_ranges,
+    get_atom_idx,
+    read_system,
+)
+
+
+def build():
+
+    inp = ParseConfig().parse_input()
+
+    saltedname, saltedpath = inp.salted.saltedname, inp.salted.saltedpath
+    comm, size, rank, parallel = detect_mpi()
+
+    species, lmax, nmax, llmax, nnmax, ndata, atomic_symbols, natoms, natmax = read_system()
+
+    rdir = f"regrdir_{saltedname}"
+
+    # sparse-GPR parameters
+    Menv = inp.gpr.Menv
+    zeta = inp.gpr.z
+
+    if rank == 0:
+        dirpath = os.path.join(saltedpath, rdir, f"M{Menv}_zeta{zeta}")
+        if not os.path.exists(dirpath):
+            os.makedirs(dirpath, exist_ok=True)
+
+    av_coefs = {} # keep outside logical
+    if inp.system.average:
+        # compute average density coefficients
+        if rank==0:
+            get_averages.build()
+        if parallel:
+            comm.Barrier()
+        # load average density coefficients
+        for spe in species:
+            av_coefs[spe] = np.load(os.path.join(saltedpath, "coefficients", "averages", f"averages_{spe}.npy"))
+
+    if parallel:
+        comm.Barrier()
+
+    # define training set at random or sequentially
+    dataset = list(range(ndata))
+    if inp.gpr.trainsel=="sequential":
+        trainrangetot = dataset[:inp.gpr.Ntrain]
+    elif inp.gpr.trainsel=="random":
+        random.Random(3).shuffle(dataset)
+        trainrangetot = dataset[:inp.gpr.Ntrain]
+    else:
+        raise ValueError(f"training set selection {inp.gpr.trainsel=} not available!")
+    np.savetxt(osp.join(
+        saltedpath, rdir, f"training_set_N{inp.gpr.Ntrain}.txt"
+    ), trainrangetot, fmt='%i')
+    ntrain = int(inp.gpr.trainfrac*inp.gpr.Ntrain)
+    trainrange = trainrangetot[:ntrain]
+
+    """
+    Calculate regression matrices in parallel or serial mode.
+    """
+
+    if parallel:
+        """ check partitioning """
+        assert size > 1, "Please run in serial mode if using a single MPI task"
+        check_MPI_tasks_count(comm, ntrain, "training structures")
+        this_task_trainrange = distribute_jobs(comm, trainrange)
+        """ calculate and gather """
+        if inp.salted.verbose:
+            print(f"Task {rank} handling structures: {format_index_ranges(this_task_trainrange,True)}", flush=True)
+        [Avec, Bmat] = matrices(this_task_trainrange, ntrain,av_coefs,rank)
+        comm.Barrier()
+        """ reduce matrices in slices to avoid MPI overflows """
+        nslices = int(np.ceil(len(Avec) / 100.0))
+        for islice in range(nslices-1):
+            Avec[islice*100:(islice+1)*100] = comm.allreduce(Avec[islice*100:(islice+1)*100])
+            Bmat[islice*100:(islice+1)*100] = comm.allreduce(Bmat[islice*100:(islice+1)*100])
+        Avec[(nslices-1)*100:] = comm.allreduce(Avec[(nslices-1)*100:])
+        Bmat[(nslices-1)*100:] = comm.allreduce(Bmat[(nslices-1)*100:])
+    else:
+        print("Running in serial mode")
+        [Avec, Bmat] = matrices(trainrange,ntrain,av_coefs,rank)
+
+    if rank==0:
+        np.save(osp.join(saltedpath, rdir, f"M{Menv}_zeta{zeta}", f"Avec_N{ntrain}.npy"), Avec)
+        np.save(osp.join(saltedpath, rdir, f"M{Menv}_zeta{zeta}", f"Bmat_N{ntrain}.npy"), Bmat)
+
+
+def _compute_sparse_operations(psivec, ref_projs, over, sparse_algorithm):
+    """
+    Compute sparse matrix operations with fallback logic.
+
+    Args:
+        psivec: Sparse matrix (scipy.sparse)
+        ref_projs: Dense vector/matrix
+        over: Dense overlap matrix
+        sparse_algorithm: "numba", "dense", or "omp_sparse"
+
+    Returns:
+        (avec_contrib, bmat_contrib, algorithm_used)
+    """
+    if sparse_algorithm == "omp_sparse":
+        try:
+            from salted.omp_sparse import dense_dot_sparse, sparse_transpose_dot_dense
+
+            # Avec += psi.T @ ref_projs
+            avec_contrib = sparse_transpose_dot_dense(psivec, ref_projs)
+
+            # Bmat += psi.T @ (over @ psi)
+            bmat_contrib = sparse_transpose_dot_dense(psivec, dense_dot_sparse(over, psivec))
+
+            return avec_contrib, bmat_contrib, "omp_sparse"
+
+        except Exception as e:
+            print(f"Warning: omp_sparse unavailable ({e}), falling back to numba", flush=True)
+            sparse_algorithm = "numba"
+
+    if sparse_algorithm == "numba":
+        from salted.numba_sparse import get_hessian_engine
+        N_df, K_rkhs = psivec.shape
+        avec_contrib = psivec.T @ ref_projs               # O(nnz) vector multiply
+        engine       = get_hessian_engine(N_df, K_rkhs)
+        bmat_contrib = engine.compute(over, psivec).copy()
+        return avec_contrib, bmat_contrib, "numba"
+
+    # Dense fallback (original behavior)
+    psi_dense = psivec.toarray()
+    avec_contrib = np.dot(psi_dense.T, ref_projs)
+    bmat_contrib = np.dot(psi_dense.T, np.dot(over, psi_dense))
+
+    return avec_contrib, bmat_contrib, "dense"
+
+
+def matrices(trainrange,ntrain,av_coefs,rank):
+
+    inp = ParseConfig().parse_input()
+
+    saltedname, saltedpath = inp.salted.saltedname, inp.salted.saltedpath
+    # sparse-GPR parameters
+    Menv = inp.gpr.Menv
+    zeta = inp.gpr.z
+    fdir = f"rkhs-vectors_{saltedname}"
+    sparse_algorithm = inp.gpr.sparse_algorithm
+
+    if rank == 0:
+        print(f"Using sparse algorithm: {sparse_algorithm}", flush=True)
+
+    if inp.salted.saltedtype=="density-response":
+        p = sparse.load_npz(osp.join(
+            saltedpath, fdir, f"M{Menv}_zeta{zeta}", f"psi-nm_conf0_x.npz"
+        ))
+    else:
+        p = sparse.load_npz(osp.join(
+            saltedpath, fdir, f"M{Menv}_zeta{zeta}", f"psi-nm_conf0.npz"
+        ))
+
+    species, lmax, nmax, llmax, nnmax, ndata, atomic_symbols, natoms, natmax = read_system()
+    atom_per_spe, natoms_per_spe = get_atom_idx(ndata,natoms,species,atomic_symbols)
+
+    totsize = p.shape[-1]
+    if rank == 0: print("problem dimensionality:", totsize,flush=True)
+    if totsize>100000:
+        raise ValueError(f"problem dimension too large ({totsize=}), minimize directly loss-function instead!")
+
+    if rank == 0: print("computing regression matrices...")
+
+    Avec = np.zeros(totsize)
+    Bmat = np.zeros((totsize,totsize))
+    for iconf in trainrange:
+
+        start_time = time.time()
+
+        if inp.salted.saltedtype=="density":
+
+            # load reference QM data
+            ref_coefs = np.load(osp.join(
+                saltedpath, "coefficients", f"coefficients_conf{iconf}.npy"
+            ))
+            over = np.load(osp.join(
+                saltedpath, "overlaps", f"overlap_conf{iconf}.npy"
+            ))
+            psivec = sparse.load_npz(osp.join(
+                saltedpath, fdir, f"M{Menv}_zeta{zeta}", f"psi-nm_conf{iconf}.npz"
+            ))
+
+            if inp.system.average:
+
+                # fill array of average spherical components
+                Av_coeffs = np.zeros(ref_coefs.shape[0])
+                i = 0
+                for iat in range(natoms[iconf]):
+                    spe = atomic_symbols[iconf][iat]
+                    if spe in species:
+                        for l in range(lmax[spe]+1):
+                            for n in range(nmax[(spe,l)]):
+                                if l==0:
+                                   Av_coeffs[i] = av_coefs[spe][n]
+                                i += 2*l+1
+
+                # subtract average
+                ref_coefs -= Av_coeffs
+
+            ref_projs = np.dot(over,ref_coefs)
+
+            # Use sparse operations with automatic fallback
+            avec_contrib, bmat_contrib, algorithm_used = _compute_sparse_operations(
+                psivec, ref_projs, over, sparse_algorithm
+            )
+            if algorithm_used != sparse_algorithm:
+                # set sparse_algorithm to algorithm_used
+                print(f"Warning: Using fallback dense algorithm for conf {iconf} due to failure in {sparse_algorithm}, set current sparse_algorithm to {algorithm_used}", flush=True)
+                sparse_algorithm = algorithm_used
+            Avec += avec_contrib
+            Bmat += bmat_contrib
+
+
+        elif inp.salted.saltedtype=="density-response":
+
+            over = np.load(osp.join(
+                saltedpath, "overlaps", f"overlap_conf{iconf}.npy"
+            ))
+
+            for icart in ["x","y","z"]:
+
+                ref_coefs = np.load(osp.join(
+                    saltedpath, "coefficients", f"{icart}/coefficients_conf{iconf}.npy"
+                ))
+                psivec = sparse.load_npz(osp.join(
+                    saltedpath, fdir, f"M{Menv}_zeta{zeta}", f"psi-nm_conf{iconf}_{icart}.npz"
+                ))
+
+                ref_projs = np.dot(over,ref_coefs)
+
+                # Use sparse operations with automatic fallback
+                avec_contrib, bmat_contrib, algorithm_used = _compute_sparse_operations(
+                    psivec, ref_projs, over, sparse_algorithm
+                )
+                Avec += avec_contrib
+                Bmat += bmat_contrib
+
+        if inp.salted.verbose: print(f"conf {iconf}, time = {(time.time() - start_time):.2f} s", flush=True)
+
+    Avec /= float(ntrain)
+    Bmat /= float(ntrain)
+
+    return [Avec,Bmat]
+
+if __name__ == "__main__":
+    build()

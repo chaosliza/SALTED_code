@@ -1,0 +1,50 @@
+cc-pvtz-jkfit:
+  H:
+    lmax: 3
+    nmax: [4, 3, 2, 1]
+  B:
+    lmax: 4
+    nmax: [10, 7, 5, 2, 1]
+  C:
+    lmax: 4
+    nmax: [10, 7, 5, 2, 1]
+  N:
+    lmax: 4
+    nmax: [10, 7, 5, 2, 1]
+  O:
+    lmax: 4
+    nmax: [10, 7, 5, 2, 1]
+  F:
+    lmax: 4
+    nmax: [10, 7, 5, 2, 1]
+  Al:
+    lmax: 4
+    nmax: [13, 11, 9, 3, 1]
+  Si:
+    lmax: 4
+    nmax: [13, 11, 9, 3, 1]
+  P: 
+    lmax: 4
+    nmax: [13, 11, 9, 3 ,1]
+  S:
+    lmax: 4
+    nmax: [13, 11, 9, 3, 1]
+  Cl:
+    lmax: 4
+    nmax: [13, 11, 9, 3, 1]
+  Ga:
+    lmax: 4
+    nmax: [16, 14, 12, 10, 7]
+  Ge:
+    lmax: 4
+    nmax: [16, 14, 12, 10, 7]
+  As:
+    lmax: 4
+    nmax: [16, 14, 12, 10, 7]
+  Se:
+    lmax: 4
+    nmax: [16, 14, 12, 10, 7]
+  Br:
+    lmax: 4
+    nmax: [16, 14, 12, 10, 7]
+
