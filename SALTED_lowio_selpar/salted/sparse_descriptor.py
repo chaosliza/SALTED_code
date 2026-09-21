@@ -1,0 +1,346 @@
+import os
+import sys
+import time
+import os.path as osp
+from ase.io import read
+import h5py
+
+import numpy as np
+from scipy import sparse
+from ase.data import atomic_numbers
+
+from salted.sys_utils import (
+    ParseConfig,
+    check_MPI_tasks_count,
+    detect_mpi,
+    distribute_jobs,
+    format_index_ranges,
+    get_atom_idx,
+    read_system,
+)
+
+from salted import wigner
+from salted import sph_utils
+from salted import basis
+from salted.selection_utils import load_training_indices
+
+from salted.sph_utils import equicombnonorm, antiequicombnonorm
+
+def build():
+
+    inp = ParseConfig().parse_input()
+
+    # salted parameters
+    (saltedname, saltedpath, saltedtype,
+    filename, species, average,
+    path2qm, qmcode, qmbasis, dfbasis,
+    filename_pred, predname, predict_data, alpha_only,
+    rep1, rcut1, sig1, nrad1, nang1, neighspe1,
+    rep2, rcut2, sig2, nrad2, nang2, neighspe2,
+    sparsify, nsamples, ncut,
+    zeta, Menv, Ntrain, trainfrac, regul, eigcut,
+    gradtol, restart, trainsel, nspe1, nspe2, HP1, HP2) = ParseConfig().get_all_params()
+
+    comm, size, rank, parallel = detect_mpi()
+
+    train_indices = load_training_indices(inp)
+    species, lmax, nmax, lmax_max, nnmax, ndata, atomic_symbols, natoms, natmax = read_system(
+        conf_indices=train_indices
+    )
+    atom_idx, natom_dict = get_atom_idx(
+        ndata, natoms, species, atomic_symbols, conf_indices=train_indices
+    )
+
+    frames = read(filename,":")
+
+    sdir = osp.join(saltedpath, f"equirepr_{saltedname}")
+
+    # Distribute structures to tasks
+    if parallel:
+        check_MPI_tasks_count(comm, ndata)
+        conf_range = distribute_jobs(comm, train_indices)
+        if inp.salted.verbose:
+            print(f"Task {rank} handles the following structures: {format_index_ranges(conf_range,True)}", flush=True)
+    else:
+        conf_range = train_indices
+
+    sparse_set = np.loadtxt(osp.join(sdir, f"sparse_set_{Menv}.txt"),int)
+    fps_idx = sparse_set[:,0]
+    fps_species = sparse_set[:,1]
+
+    Mspe = {}
+    for spe in species:
+        Mspe[spe] = 0
+
+    fps_indexes_per_conf = {}
+    for iconf in train_indices:
+        for spe in species:
+            fps_indexes_per_conf[(iconf,spe)] = []
+
+    itot = 0
+    Midx_spe = {}
+    for iconf in train_indices:
+        for spe in species:
+            Midx_spe[(iconf,spe)] = Mspe[spe]
+        for iat in range(natoms[iconf]):
+            if itot in fps_idx:
+                for spe in species:
+                    if iat in atom_idx[(iconf,spe)]:
+                        fps_indexes_per_conf[(iconf,spe)].append(iat)
+                        Mspe[spe] += 1
+            itot += 1
+
+    if saltedtype=="density":
+
+        # Load sparsification details if needed
+        if sparsify:
+            vfps = {}
+            for lam in range(lmax_max+1):
+                vfps[lam] = np.load(osp.join(
+                    saltedpath, f"equirepr_{saltedname}", f"fps{ncut}-{lam}.npy"
+                ))
+
+        power_env_sparse = {}
+        for spe in species:
+            for lam in range(lmax_max+1):
+                if sparsify:
+                    featsize = ncut
+                else:
+                    [llmax,llvec] = sph_utils.get_angular_indexes_symmetric(lam,nang1,nang2)
+                    featsize = nspe1*nspe2*nrad1*nrad2*llmax
+                if lam==0:
+                    power_env_sparse[(spe,lam)] = np.zeros((Mspe[spe],featsize))
+                else:
+                    power_env_sparse[(spe,lam)] = np.zeros((Mspe[spe],(2*lam+1),featsize))
+
+        # lam-dependent only, so hoisted out of the per-structure loop below.
+        # The wigner loadtxt was costing one shared-filesystem open per structure
+        # per lambda: ndata x (lmax_max+1) = 49,245 opens for this model, on 16 KB
+        # of constants. Same values, read once. (rkhs_vector got the same fix via
+        # PsiBuilder; the two density-response loops below still have the pattern.)
+        per_lam = {}
+        for lam in range(lmax_max+1):
+            _llmax, _llvec = sph_utils.get_angular_indexes_symmetric(lam,nang1,nang2)
+            _wig = np.loadtxt(os.path.join(
+                saltedpath, "wigners", f"wigner_lam-{lam}_lmax1-{nang1}_lmax2-{nang2}.dat"
+            ))
+            _c2r = sph_utils.complex_to_real_transformation([2*lam+1])[0]
+            per_lam[lam] = (_llmax, _llvec, _wig, _c2r)
+
+        for iconf in conf_range:
+
+            start_time = time.time()
+
+            structure = frames[iconf]
+
+            # Compute spherical harmonics expansion coefficients
+            omega1 = sph_utils.get_representation_coeffs(
+                structure, rep1, HP1, rank, neighspe1, species, nang1, nrad1, natoms[iconf])
+            if sph_utils.reps_equivalent(rep1, neighspe1, HP1, rep2, neighspe2, HP2):
+                omega2 = omega1
+            else:
+                omega2 = sph_utils.get_representation_coeffs(
+                    structure, rep2, HP2, rank, neighspe2, species, nang2, nrad2, natoms[iconf])
+
+            # Reshape arrays of expansion coefficients for optimal Fortran indexing
+            v1 = np.transpose(omega1,(1,3,0,2)).copy()
+            v2 = np.transpose(omega2,(1,3,0,2)).copy()
+
+            # Compute equivariant features for the given structure
+            for lam in range(lmax_max+1):
+
+                llmax, llvec, wigner3j, c2r = per_lam[lam]
+
+                # Perform symmetry-adapted combination following Eq.S19 of Grisafi et al., PRL 120, 036002 (2018)
+                if sparsify:
+
+                    featsize = nspe1*nspe2*nrad1*nrad2*llmax
+                    nfps = len(vfps[lam])
+                    p = sph_utils.equicombsparse_numba(natoms[iconf],nang1,nang2,nspe1*nrad1,nspe2*nrad2,v1,v2,wigner3j,llmax,llvec,lam,c2r,featsize,nfps,vfps[lam])
+                    featsize = ncut
+
+                else:
+
+                    featsize = nspe1*nspe2*nrad1*nrad2*llmax
+                    p = sph_utils.equicomb_numba(natoms[iconf],nang1,nang2,nspe1*nrad1,nspe2*nrad2,v1,v2,wigner3j,llmax,llvec,lam,c2r,featsize)
+                
+                # Fill vector of equivariant descriptor
+                if lam==0:
+                    power = p.reshape(natoms[iconf],featsize)
+                else:
+                    power = p.reshape(natoms[iconf],2*lam+1,featsize)
+
+                for spe in species:
+                    nfps = len(fps_indexes_per_conf[(iconf,spe)])
+                    power_env_sparse[(spe,lam)][Midx_spe[(iconf,spe)]:Midx_spe[(iconf,spe)]+nfps] = power[fps_indexes_per_conf[(iconf,spe)]]
+
+            if inp.salted.verbose: print(f"conf {iconf}, time = {(time.time() - start_time):.2f} s", flush=True)
+
+        if parallel:
+            comm.Barrier()
+            for spe in species:
+                for lam in range(lmax[spe]+1):
+                    power_env_sparse[(spe,lam)] = comm.allreduce(power_env_sparse[(spe,lam)])
+
+        if rank==0:
+            # reshape sparse vector and save
+            h5f = h5py.File(osp.join(sdir,  f"FEAT_M-{Menv}.h5"), 'w')
+            for spe in species:
+                for lam in range(lmax[spe]+1):
+                    power_env_sparse[(spe,lam)] = power_env_sparse[(spe,lam)].reshape(Mspe[spe]*(2*lam+1),power_env_sparse[(spe,lam)].shape[-1])
+                    h5f.create_dataset(f"sparse_descriptors/{spe}/{lam}",data=power_env_sparse[(spe,lam)])
+            h5f.close()
+
+    elif saltedtype=="density-response":
+
+        lmax_max += 1
+        for spe in species:
+            lmax[spe] += 1
+
+        power_env_sparse = {}
+        for spe in species:
+            for lam in range(lmax_max+1):
+                [llmax,llvec] = sph_utils.get_angular_indexes_symmetric(lam,nang1,nang2)
+                featsize = nspe1*nspe2*nrad1*nrad2*llmax
+                if lam==0:
+                    power_env_sparse[(spe,lam)] = np.zeros((Mspe[spe],featsize))
+                else:
+                    power_env_sparse[(spe,lam)] = np.zeros((Mspe[spe],(2*lam+1),featsize))
+
+        for iconf in conf_range:
+    
+            # start_time = time.time()
+    
+            structure = frames[iconf]
+    
+            # Compute spherical harmonics expansion coefficients
+            omega1 = sph_utils.get_representation_coeffs(
+                structure, rep1, HP1, rank, neighspe1, species, nang1, nrad1, natoms[iconf])
+            if sph_utils.reps_equivalent(rep1, neighspe1, HP1, rep2, neighspe2, HP2):
+                omega2 = omega1
+            else:
+                omega2 = sph_utils.get_representation_coeffs(
+                    structure, rep2, HP2, rank, neighspe2, species, nang2, nrad2, natoms[iconf])
+
+            # Reshape arrays of expansion coefficients for optimal Fortran indexing
+            v1 = np.transpose(omega1,(1,3,0,2)).copy()
+            v2 = np.transpose(omega2,(1,3,0,2)).copy()
+    
+            # Compute equivariant features for the given structure
+            for lam in range(lmax_max+1):
+    
+                [llmax,llvec] = sph_utils.get_angular_indexes_symmetric(lam,nang1,nang2)
+    
+                # Load the relevant Wigner-3J symbols associated with the given triplet (lam, lmax1, lmax2)
+                wigner3j = np.loadtxt(os.path.join(
+                    saltedpath, "wigners", f"wigner_lam-{lam}_lmax1-{nang1}_lmax2-{nang2}.dat"
+                ))
+                wigdim = wigner3j.size
+    
+                # Compute complex to real transformation matrix for the given lambda value
+                c2r = sph_utils.complex_to_real_transformation([2*lam+1])[0]
+    
+                # Perform symmetry-adapted combination following Eq.S19 of Grisafi et al., PRL 120, 036002 (2018)
+                featsize = nspe1*nspe2*nrad1*nrad2*llmax
+                p = equicombnonorm(natoms[iconf],nang1,nang2,nspe1*nrad1,nspe2*nrad2,v1,v2,wigner3j,llmax,llvec,lam,c2r,featsize)
+    
+                # Fill vector of equivariant descriptor
+                if lam==0:
+                    power = p.reshape(natoms[iconf],featsize)
+                else:
+                    power = p.reshape(natoms[iconf],2*lam+1,featsize)
+    
+                for spe in species:
+                    nfps = len(fps_indexes_per_conf[(iconf,spe)])
+                    power_env_sparse[(spe,lam)][Midx_spe[(iconf,spe)]:Midx_spe[(iconf,spe)]+nfps] = power[fps_indexes_per_conf[(iconf,spe)]]
+    
+            # end_time = time.time()
+            #print(f"{iconf} end, time cost = {(end_time - start_time):.2f} s", flush=True)
+    
+        if parallel:
+            comm.Barrier()
+            for spe in species:
+                for lam in range(lmax[spe]+1):
+                    power_env_sparse[(spe,lam)] = comm.allreduce(power_env_sparse[(spe,lam)])
+    
+        if rank==0:
+            # reshape sparse vector and save
+            h5f = h5py.File(osp.join(sdir,  f"FEAT_M-{Menv}.h5"), 'w')
+            for spe in species:
+                for lam in range(lmax[spe]+1):
+                    power_env_sparse[(spe,lam)] = power_env_sparse[(spe,lam)].reshape(Mspe[spe]*(2*lam+1),power_env_sparse[(spe,lam)].shape[-1])
+                    h5f.create_dataset(f"sparse_descriptors/{spe}/{lam}",data=power_env_sparse[(spe,lam)])
+            h5f.close()
+
+        print("Computing antisymmetric sparse descriptors for density-response representation.")
+
+        power_env_sparse_antisymm = {}
+        for spe in species:
+            for lam in range(1,lmax_max):
+                [llmax,llvec] = sph_utils.get_angular_indexes_antisymmetric(lam,nang1,nang2)
+                featsize = nspe1*nspe2*nrad1*nrad2*llmax
+                power_env_sparse_antisymm[(spe,lam)] = np.zeros((Mspe[spe],(2*lam+1),featsize))
+
+        for iconf in conf_range:
+
+            structure = frames[iconf]
+
+            # Compute spherical harmonics expansion coefficients
+            omega1 = sph_utils.get_representation_coeffs(
+                structure, rep1, HP1, rank, neighspe1, species, nang1, nrad1, natoms[iconf])
+            if sph_utils.reps_equivalent(rep1, neighspe1, HP1, rep2, neighspe2, HP2):
+                omega2 = omega1
+            else:
+                omega2 = sph_utils.get_representation_coeffs(
+                    structure, rep2, HP2, rank, neighspe2, species, nang2, nrad2, natoms[iconf])
+
+            # Reshape arrays of expansion coefficients for optimal Fortran indexing
+            v1 = np.transpose(omega1,(1,3,0,2)).copy()
+            v2 = np.transpose(omega2,(1,3,0,2)).copy()
+
+            # Compute equivariant features for the given structure
+            for lam in range(1,lmax_max):
+
+                [llmax,llvec] = sph_utils.get_angular_indexes_antisymmetric(lam,nang1,nang2)
+
+                # Load the relevant Wigner-3J symbols associated with the given triplet (lam, lmax1, lmax2)
+                wigner3j = np.loadtxt(os.path.join(
+                    saltedpath, "wigners", f"wigner_antisymm_lam-{lam}_lmax1-{nang1}_lmax2-{nang2}.dat"
+                ))
+                wigdim = wigner3j.size
+
+                # Compute complex to real transformation matrix for the given lambda value
+                c2r = sph_utils.complex_to_real_transformation([2*lam+1])[0]
+
+                # Perform symmetry-adapted combination following Eq.S19 of Grisafi et al., PRL 120, 036002 (2018)
+                featsize = nspe1*nspe2*nrad1*nrad2*llmax
+                p = antiequicombnonorm(natoms[iconf],nang1,nang2,nspe1*nrad1,nspe2*nrad2,v1,v2,wigner3j,llmax,llvec,lam,c2r,featsize)
+
+                power = p.reshape(natoms[iconf],2*lam+1,featsize)
+
+                for spe in species:
+                    nfps = len(fps_indexes_per_conf[(iconf,spe)])
+                    power_env_sparse_antisymm[(spe,lam)][Midx_spe[(iconf,spe)]:Midx_spe[(iconf,spe)]+nfps] = power[fps_indexes_per_conf[(iconf,spe)]]
+
+        if parallel:
+            comm.Barrier()
+            for spe in species:
+                for lam in range(1,lmax[spe]):
+                    power_env_sparse_antisymm[(spe,lam)] = comm.allreduce(power_env_sparse_antisymm[(spe,lam)])
+
+        if rank==0:
+            # reshape sparse vector and save
+            h5f = h5py.File(osp.join(sdir,  f"FEAT_M-{Menv}_antisymm.h5"), 'w')
+            for spe in species:
+                for lam in range(1,lmax[spe]):
+                    power_env_sparse_antisymm[(spe,lam)] = power_env_sparse_antisymm[(spe,lam)].reshape(Mspe[spe]*(2*lam+1),power_env_sparse_antisymm[(spe,lam)].shape[-1])
+                    h5f.create_dataset(f"sparse_descriptors/{spe}/{lam}",data=power_env_sparse_antisymm[(spe,lam)])
+            h5f.close()
+
+        # end_time = time.time()
+        #print(f"{iconf} end, time cost = {(end_time - start_time):.2f} s", flush=True)
+
+
+
+if __name__ == "__main__":
+    build()
